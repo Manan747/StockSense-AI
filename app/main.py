@@ -15,9 +15,15 @@ from slowapi.errors import RateLimitExceeded
 # Load environment variables
 load_dotenv()
 
-from app.screener import get_screener_data, NIFTY_50_TICKERS
-from app.ai_analyst import get_investment_thesis
+from app.screener import get_screener_data, NIFTY_50_TICKERS, session
+from app.ai_analyst import get_investment_thesis, get_goal_path_explanation
 from app.cache import screener_cache
+from app.goal_path import get_portfolio_recommendation, get_performance_benchmark
+from app.projection_engine import run_projections
+from app.backtest_engine import run_backtest
+from app.risk_engine import simulate_market_crash
+from app.scoring_engine import calculate_confidence_score, get_decision_summary
+from pydantic import BaseModel, Field
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -128,8 +134,8 @@ async def get_stock_detail(
         max_attempts = 2
         for attempt in range(max_attempts):
             try:
-                t = yf.Ticker(ticker)
-                hist_df = t.history(period="1y", interval="1d")
+                t = yf.Ticker(ticker, session=session)
+                hist_df = t.history(period="2y", interval="1d")
                 if hist_df.empty:
                     raise ValueError("No historical data returned")
                 return hist_df
@@ -235,3 +241,109 @@ async def get_stock_analysis(
     except Exception as e:
         logger.error(f"[{req_id}] {ticker} | failed_analysis | {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to generate investment thesis. Please check configuration and network connectivity.")
+
+class GoalPathRequest(BaseModel):
+    target_amount: float = Field(..., gt=0)
+    time_horizon: int = Field(..., gt=0, le=100)
+    monthly_sip: float = Field(default=0.0, ge=0)
+    lump_sum: float = Field(default=0.0, ge=0)
+    risk_tolerance: str = Field(default="medium")
+    tone: str = Field(default="advanced")
+    inflation_rate: float = Field(default=0.0, ge=0.0, le=0.15)
+    return_shock: float = Field(default=0.0, ge=-0.10, le=0.10)
+    time_delay: int = Field(default=0, ge=0, le=10)
+
+@app.post("/api/goal-path")
+@limiter.limit("10/minute")
+async def calculate_goal_path(request: Request, body: GoalPathRequest):
+    """
+    Computes financial goal roadmap, feasibility metrics, risk asset allocation,
+    live screener stock suggestions, historical performance simulation, and AI explanations.
+    Upgraded to include scenarios, backtesting, market crashes, and confidence scoring.
+    """
+    try:
+        # 1. Financial path projections & adjustments (with scenarios)
+        proj_results = run_projections(
+            target_amount=body.target_amount,
+            time_horizon=body.time_horizon,
+            monthly_sip=body.monthly_sip,
+            lump_sum=body.lump_sum,
+            risk_tolerance=body.risk_tolerance,
+            inflation_rate=body.inflation_rate,
+            return_shock=body.return_shock,
+            time_delay=body.time_delay
+        )
+        
+        # 2. Recommended portfolio asset allocation & stock suggestions
+        screener_data = await asyncio.to_thread(get_screener_data, force_refresh=False)
+        portfolio_results = get_portfolio_recommendation(body.risk_tolerance, screener_data)
+        
+        # Merge portfolio details into final data payload
+        proj_results.update(portfolio_results)
+        proj_results["risk_tolerance"] = body.risk_tolerance
+        
+        # 3. Historical Backtesting comparison
+        backtest_results = await asyncio.to_thread(
+            run_backtest,
+            lump_sum=body.lump_sum,
+            monthly_sip=body.monthly_sip,
+            risk_tolerance=body.risk_tolerance,
+            time_horizon=body.time_horizon
+        )
+        
+        # 4. Severe Market Crash downturn simulation
+        risk_shock_results = simulate_market_crash(
+            target_amount=body.target_amount,
+            time_horizon=body.time_horizon,
+            monthly_sip=body.monthly_sip,
+            lump_sum=body.lump_sum,
+            risk_tolerance=body.risk_tolerance
+        )
+        
+        # 5. Non-AI Confidence Score & Decision Verdict
+        conf_score = calculate_confidence_score(
+            target_amount=body.target_amount,
+            projected_value=proj_results["projected_value"],
+            risk_tolerance=body.risk_tolerance,
+            time_horizon=body.time_horizon
+        )
+        
+        decision_summary = get_decision_summary(
+            target_amount=body.target_amount,
+            projected_value=proj_results["projected_value"],
+            gap=proj_results["gap"],
+            sip_adjustment=proj_results["sip_adjustment"],
+            required_sip=proj_results["required_sip"],
+            time_extension_years=proj_results["time_extension_years"],
+            confidence_score=conf_score
+        )
+        
+        # 6. Generate Gemini explanation
+        try:
+            explanation = await asyncio.wait_for(
+                asyncio.to_thread(get_goal_path_explanation, proj_results, "internal", body.tone),
+                timeout=10.0
+            )
+        except Exception as e:
+            logger.error(f"Error or timeout generating goal path AI explanation: {str(e)}")
+            explanation = {
+                "why_it_works": "Calculated strategy details loaded. Live AI advisory synthesis is temporarily unavailable.",
+                "tradeoffs": f"Goal progress check: Expected to reach {proj_results.get('projected_value'):,} in {proj_results.get('time_horizon')} years.",
+                "top_3_risks": "1. Market volatility under Nifty index cycles.\n2. Asset allocation tracking errors.\n3. Sequence of returns timing risk.",
+                "what_could_go_wrong": "Connectivity issues or API rate limits prevented generating an advisory thesis. Standard projections and backtesting remain fully active."
+            }
+        
+        # 7. Fetch general Nifty 50 vs AI Buy benchmark (1-Year daily proxy for compatibility)
+        benchmark = await asyncio.to_thread(get_performance_benchmark)
+        
+        return {
+            "projections": proj_results,
+            "explanation": explanation,
+            "benchmark": benchmark,
+            "backtest": backtest_results,
+            "risk_shock": risk_shock_results,
+            "decision_summary": decision_summary
+        }
+    except Exception as e:
+        logger.error(f"Error in /api/goal-path: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to generate goal roadmap: {str(e)}")

@@ -3,12 +3,21 @@ import concurrent.futures
 import numpy as np
 import pandas as pd
 import yfinance as yf
+import requests
 from typing import List, Dict, Any
 from app.cache import screener_cache
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Configure session with standard browser headers to avoid HTTP 429 rate limits
+session = requests.Session()
+session.headers.update({
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.5',
+})
 
 # 50 Nifty 50 Tickers with .NS suffix
 NIFTY_50_TICKERS = [
@@ -63,7 +72,7 @@ def fetch_ticker_info(ticker: str) -> Dict[str, Any]:
     Handles rate-limiting and other connection issues gracefully.
     """
     try:
-        t = yf.Ticker(ticker)
+        t = yf.Ticker(ticker, session=session)
         info = t.info
         return {
             "ticker": ticker,
@@ -105,7 +114,8 @@ def get_screener_data(force_refresh: bool = False) -> List[Dict[str, Any]]:
             period="1y",
             interval="1d",
             group_by="ticker",
-            progress=False
+            progress=False,
+            session=session
         )
     except Exception as e:
         logger.error(f"Failed to batch download historical data: {str(e)}")
@@ -191,6 +201,54 @@ def get_screener_data(force_refresh: bool = False) -> List[Dict[str, Any]]:
                 logger.error(f"Error parsing history for {ticker}: {str(e)}")
                 
         combined_results.append(stock_result)
+        
+    TICKER_SECTORS = {
+        "RELIANCE.NS": "Energy", "TCS.NS": "IT", "HDFCBANK.NS": "Banking", "ICICIBANK.NS": "Banking", "BHARTIARTL.NS": "Telecom",
+        "INFY.NS": "IT", "ITC.NS": "FMCG", "SBIN.NS": "Banking", "LICI.NS": "Financial Services", "LT.NS": "Construction & Engineering",
+        "HINDUNILVR.NS": "FMCG", "HCLTECH.NS": "IT", "AXISBANK.NS": "Banking", "SUNPHARMA.NS": "Healthcare", "KOTAKBANK.NS": "Banking",
+        "TATAMOTORS.NS": "Automobile", "NTPC.NS": "Power", "ONGC.NS": "Energy", "COALINDIA.NS": "Metals & Mining", "ADANIENT.NS": "Conglomerates",
+        "ADANIPORTS.NS": "Services & Ports", "MARUTI.NS": "Automobile", "POWERGRID.NS": "Power", "TATASTEEL.NS": "Metals & Mining", "TITAN.NS": "Consumer Durables",
+        "ULTRACEMCO.NS": "Construction Materials", "JSWSTEEL.NS": "Metals & Mining", "GRASIM.NS": "Construction Materials", "NESTLEIND.NS": "FMCG", "TECHM.NS": "IT",
+        "BAJFINANCE.NS": "Financial Services", "WIPRO.NS": "IT", "ASIANPAINT.NS": "Consumer Durables", "HINDALCO.NS": "Metals & Mining", "SBILIFE.NS": "Financial Services",
+        "HDFCLIFE.NS": "Financial Services", "DRREDDY.NS": "Healthcare", "CIPLA.NS": "Healthcare", "APOLLOHOSP.NS": "Healthcare", "TATACONSUM.NS": "FMCG",
+        "BPCL.NS": "Energy", "BRITANNIA.NS": "FMCG", "INDUSINDBK.NS": "Banking", "EICHERMOT.NS": "Automobile", "DIVISLAB.NS": "Healthcare",
+        "HEROMOTOCO.NS": "Automobile", "BAJAJ-AUTO.NS": "Automobile", "BAJAJFINSV.NS": "Financial Services", "SHRIRAMFIN.NS": "Financial Services", "M&M.NS": "Automobile"
+    }
+
+    # Count how many stocks in TICKER_SECTORS belong to each sector
+    sector_peer_count = {}
+    for ticker, sect in TICKER_SECTORS.items():
+        sector_peer_count[sect] = sector_peer_count.get(sect, 0) + 1
+
+    # Group results by sector and find the list of valid P/E values
+    sector_pes = {}
+    for res in combined_results:
+        ticker = res["ticker"]
+        sect = TICKER_SECTORS.get(ticker, "Other")
+        res["sector"] = sect
+        pe = res["pe"]
+        if pe is not None and pe > 0:
+            if sect not in sector_pes:
+                sector_pes[sect] = []
+            sector_pes[sect].append(pe)
+            
+    sector_medians = {}
+    for sect, pes in sector_pes.items():
+        # Only calculate median if the sector has at least 3 peers in the dataset
+        if sector_peer_count.get(sect, 0) >= 3 and pes:
+            sector_medians[sect] = float(np.median(pes))
+            
+    # Assign sector median and calculation back to results
+    for res in combined_results:
+        sect = res.get("sector", "Other")
+        if sector_peer_count.get(sect, 0) < 3:
+            res["sector_pe_median"] = "Limited peer data"
+        else:
+            median = sector_medians.get(sect)
+            if median is not None:
+                res["sector_pe_median"] = float(round(median, 2))
+            else:
+                res["sector_pe_median"] = "Limited peer data"
         
     # Store combined results in cache
     screener_cache.set(cache_key, combined_results)
